@@ -148,7 +148,6 @@ const ProxyMonitor = {
       return false;
     }
 
-    console.log(`failover: proxy disabled ${key}`);
     // This is harsh, but these requests are too important.
     return true;
   },
