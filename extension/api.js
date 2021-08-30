@@ -3,12 +3,17 @@ const { Services } = ChromeUtils.import("resource://gre/modules/Services.jsm");
 const { XPCOMUtils } = ChromeUtils.import(
   "resource://gre/modules/XPCOMUtils.jsm"
 );
-XPCOMUtils.defineLazyGlobalGetters(this, ["ChannelWrapper"]);
+XPCOMUtils.defineLazyGlobalGetters(this, ["ChannelWrapper", "WebExtensionPolicy"]);
 XPCOMUtils.defineLazyServiceGetter(
   this,
   "ProxyService",
   "@mozilla.org/network/protocol-proxy-service;1",
   "nsIProtocolProxyService"
+);
+ChromeUtils.defineModuleGetter(
+  this,
+  "AddonManager",
+  "resource://gre/modules/AddonManager.jsm"
 );
 
 const directProxy = ["direct"];
@@ -242,12 +247,8 @@ const ProxyMonitor = {
     }
   },
 
-  get failoverEnabled() {
-    return Services.prefs.getBoolPref(PREF_PROXY_FAILOVER, true);
-  },
-
   startup() {
-    if (!this.failoverEnabled || this.started) {
+    if (this.started) {
       return;
     }
     // Register filter with a very high position, this will sort to the last filter called.
@@ -257,6 +258,7 @@ const ProxyMonitor = {
     );
     this.started = true;
     this.restore();
+    console.log("ProxyMonitor started");
   },
 
   shutdown() {
@@ -266,23 +268,89 @@ const ProxyMonitor = {
     ProxyService.unregisterFilter(ProxyMonitor);
     this.started = false;
     this.store();
-
+    console.log("ProxyMonitor stopped");
   }
 }
 
-Services.prefs.addObserver(PREF_PROXY_FAILOVER, async function prefObserver() {
-  if (ProxyMonitor.failoverEnabled) {
-    ProxyMonitor.startup();
-  } else {
+
+/**
+ * Listen for changes in addons and pref to start or stop the ProxyMonitor.
+ */
+const monitor = {
+  startup() {
+    if (this.failoverEnabled) {
+      AddonManager.addAddonListener(this);
+      if (this.hasProxyExtension()) {
+        ProxyMonitor.startup();
+      }
+    }
+  },
+
+  shutdown() {
+    AddonManager.removeAddonListener(this);
     ProxyMonitor.shutdown();
-  }
-});
+  },
+
+  observe() {
+    if (monitor.failoverEnabled) {
+      monitor.startup();
+    } else {
+      monitor.shutdown();
+    }
+  },
+
+  hasProxyExtension() {
+    for (let policy of WebExtensionPolicy.getActiveExtensions()) {
+      if (policy.hasPermission("proxy")) {
+        return true;
+      }
+    }
+    return false;
+  },
+
+  get failoverEnabled() {
+    return Services.prefs.getBoolPref(PREF_PROXY_FAILOVER, true);
+  },
+
+  shouldMonitor(addon) {
+    return addon.type == "extension" 
+      && !addon.isSystem 
+      && WebExtensionPolicy.getByID(addon.id).hasPermission("proxy");
+  },
+
+  onEnabled(addon) {
+    if (this.shouldMonitor(addon)) {
+      ProxyMonitor.startup();
+    }
+  },
+
+  onDisabled(addon) {
+    if (!this.hasProxyExtension()) {
+      ProxyMonitor.shutdown();
+    }
+  },
+
+  onInstalled(addon) {
+    if (this.shouldMonitor(addon)) {
+      ProxyMonitor.startup();
+    }
+  },
+
+  onUninstalled(addon) {
+    if (!this.hasProxyExtension()) {
+      ProxyMonitor.shutdown();
+    }
+  },
+};
 
 this.failover = class extends ExtensionAPI {
   onStartup() {
-    ProxyMonitor.startup();
+    monitor.startup();
+    Services.prefs.addObserver(PREF_PROXY_FAILOVER, monitor);
   }
+
   onShutdown() {
-    ProxyMonitor.shutdown();
+    monitor.shutdown();
+    Services.prefs.removeObserver(PREF_PROXY_FAILOVER, monitor);
   }
 };
