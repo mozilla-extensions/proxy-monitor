@@ -11,11 +11,12 @@ XPCOMUtils.defineLazyServiceGetter(
   "nsIProtocolProxyService"
 );
 
-const directProxy = ["direct", "system"];
+const directProxy = ["direct"];
 const DISABLE_HOURS = 48;
 const MAX_DISABLED_PI = 10;
 const MAX_DIRECT_FAILURES = 20;
 const PREF_MONITOR_DATA = "extensions.proxyMonitor";
+const PREF_PROXY_FAILOVER = "network.proxy.failover_direct";
 
 function hoursSince(dt2, dt1 = Date.now()) {
   var diff = (dt2 - dt1) / 1000;
@@ -27,12 +28,14 @@ function hoursSince(dt2, dt1 = Date.now()) {
  * ProxyMonitor monitors system and protected requests for failures
  * due to bad or unavailable proxy configurations.
  * 
- * Any proxy configuration that fails is disabled.  On later requests,
- * disabled proxies are removed from the proxy chain.  Disabled proxy
- * configurations remain disabled for 48 hours to allow any necessary
+ * 1. Any proxied system request without a direct failover will have one added.
+ * 
+ * 2. If a proxied system request fails, the proxy configuration in use will
+ * be disabled.  On later requests, disabled proxies are removed from the proxy chain.
+ * Disabled proxy configurations remain disabled for 48 hours to allow any necessary
  * requests to operate for a period of time.
  * 
- * If too many proxy configurations get disabled, we completely disable proxies
+ * 3. If too many proxy configurations get disabled, we completely disable proxies
  * for these requests.  This state remains for 48 hours.
  * 
  * If we've disabled proxies, we continue to watch the requests for failures in
@@ -40,12 +43,14 @@ function hoursSince(dt2, dt1 = Date.now()) {
  * we fall back to allowing proxies again.
  */
 const ProxyMonitor = {
+  started: false,
   errors: new Map(),
   disabledTime: 0,
   directFailures: 0,
 
   async applyFilter(channel, defaultProxyInfo, proxyFilter) {
     let proxyInfo = defaultProxyInfo;
+    // onProxyFilterResult must be called, so we wrap in a try/finally.
     try {
       if (!proxyInfo) {
         // If no proxy is in use, exit early.
@@ -74,26 +79,26 @@ const ProxyMonitor = {
       // and continue to use configurations that have not yet failed.
 
       // Prune our disabled PIs.  Flatten to an array, and re-link the chain.
-      let piList = [];
+      let enabledProxies = [];
       let pi = proxyInfo;
       while (pi) {
         if (!this.proxyDisabled(pi)) {
-          piList.push(pi);
+          enabledProxies.push(pi);
         }
         pi = pi.failoverProxy;
       }
-      if (!piList.length) {
+      if (!enabledProxies.length) {
         // No proxies are enabled, we can bail out.
         proxyInfo = null;
         return;
       }
-      // There is at least one PI left enabled.
+      // There is at least one PI left enabled, re-link the proxy chain.
       // failoverProxy cannot be set to undefined, so || null
-      for (let i = 0; i++; i < Math.max(piList.length - 2, 0)) {
-        piList[pi].failoverProxy = piList[pi + 1] || null; // undefined when > length
+      for (let i = 0; i++; i < Math.max(enabledProxies.length - 2, 0)) {
+        enabledProxies[pi].failoverProxy = enabledProxies[pi + 1] || null; // undefined when > length
       }
-      proxyInfo = piList[0];
-      let failover = piList.pop();
+      proxyInfo = enabledProxies[0];
+      let lastFailover = enabledProxies.pop();
 
       // A little debug output
       // pi = proxyInfo;
@@ -102,13 +107,13 @@ const ProxyMonitor = {
       //   pi = pi.failoverProxy;
       // }
 
-      if (!directProxy.includes(failover.type)) {
+      if (!directProxy.includes(lastFailover.type)) {
         // Ensure there is always a direct failover for our critical requests.  This
         // catches connection failures such as those to non-existant or non-http ports.
-        failover.failoverProxy = ProxyService.newProxyInfo(
+        lastFailover.failoverProxy = ProxyService.newProxyInfo(
           "direct", "", 0, "", "", 0, 0, null
         );
-        // console.log(`failover: direct failover added after proxy ${failover.type}:${failover.host}:${failover.port} for "${wrapper.finalURI.spec}"`);
+        // console.log(`failover: direct failover added after proxy ${lastFailover.type}:${lastFailover.host}:${lastFailover.port} for "${wrapper.finalURI.spec}"`);
       }
     } finally {
       // This must be called.
@@ -235,20 +240,49 @@ const ProxyMonitor = {
       this.disabledTime = failovers.disabledTime;
       this.errors = new Map(failovers.errors);
     }
-  }
-}
+  },
 
-this.failover = class extends ExtensionAPI {
-  async onStartup() {
+  get failoverEnabled() {
+    return Services.prefs.getBoolPref(PREF_PROXY_FAILOVER, true);
+  },
+
+  startup() {
+    if (!this.failoverEnabled || this.started) {
+      return;
+    }
     // Register filter with a very high position, this will sort to the last filter called.
     ProxyService.registerChannelFilter(
       ProxyMonitor,
       Number.MAX_SAFE_INTEGER
     );
-    ProxyMonitor.restore();
+    this.started = true;
+    this.restore();
+  },
+
+  shutdown() {
+    if (!this.started) {
+      return;
+    }
+    ProxyService.unregisterFilter(ProxyMonitor);
+    this.started = false;
+    this.store();
+
+  }
+}
+
+Services.prefs.addObserver(PREF_PROXY_FAILOVER, async function prefObserver() {
+  if (ProxyMonitor.failoverEnabled) {
+    ProxyMonitor.startup();
+  } else {
+    ProxyMonitor.shutdown();
+  }
+});
+
+this.failover = class extends ExtensionAPI {
+  onStartup() {
+    ProxyMonitor.startup();
   }
   onShutdown() {
-    ProxyService.unregisterFilter(ProxyMonitor);
-    ProxyMonitor.store();
+    ProxyMonitor.shutdown();
   }
 };
