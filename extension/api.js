@@ -21,6 +21,7 @@ const DISABLE_HOURS = 48;
 const MAX_DISABLED_PI = 10;
 const MAX_DIRECT_FAILURES = 20;
 const PREF_MONITOR_DATA = "extensions.proxyMonitor";
+const PREF_PROXY_FAILOVER = "network.proxy.failover_direct";
 
 function hoursSince(dt2, dt1 = Date.now()) {
   var diff = (dt2 - dt1) / 1000;
