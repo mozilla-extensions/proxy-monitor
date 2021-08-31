@@ -15,6 +15,9 @@ ChromeUtils.defineModuleGetter(
   "AddonManager",
   "resource://gre/modules/AddonManager.jsm"
 );
+const { Utils } = ChromeUtils.import(
+  "resource://services-settings/Utils.jsm"
+);
 
 const PROXY_DIRECT = "direct";
 const DISABLE_HOURS = 48;
@@ -23,10 +26,67 @@ const MAX_DIRECT_FAILURES = 20;
 const PREF_MONITOR_DATA = "extensions.proxyMonitor";
 const PREF_PROXY_FAILOVER = "network.proxy.failover_direct";
 
+const REMOTE_SERVICES_ERROR = "remote-settings:sync-error"
+const CONTENT_SERVICES = new Map([
+  ["remote-settings", Utils.SERVER_URL],
+]);
+
 function hoursSince(dt2, dt1 = Date.now()) {
   var diff = (dt2 - dt1) / 1000;
   diff /= (60 * 60);
   return Math.abs(Math.round(diff));
+}
+
+/**
+ * Watch for notifications from services where content failures such as a
+ * content signature failure.
+ * 
+ * If we have these failures, a following request will bypass proxies.
+ */
+const ContentMonitor = {
+  contentErrors: new Map(),
+
+  startup() {
+    Services.obs.addObserver(this, REMOTE_SERVICES_ERROR);
+  },
+
+  shutdown() {
+    Services.obs.removeObserver(this, REMOTE_SERVICES_ERROR);
+  },
+
+  observe (subject, topic, data) {
+    switch (topic) {
+      case REMOTE_SERVICES_ERROR:
+        let e = subject.wrappedJSObject.error;
+        if (e.name.includes("SignatureError")) {
+          this.contentErrors.set("remote-settings", Date.now());
+        }
+        break;
+      case  "remote-settings:changes-poll-end":
+        // If we expand the covered services this will change, but for
+        // now, we just clear the content errors when we have a success.
+        this.contentErrors = new Map();
+      default:
+        break;
+    }
+  },
+  
+  checkErrors(url) {
+    // If we have content errors, bypass proxy.  We wont have any specific proxyInfo data
+    // for content errors since they happen after a request is finished.
+    for (let [source, timestamp] of this.contentErrors) {
+      let baseUrl = CONTENT_SERVICES.get(source);
+      if (baseUrl && url.startsWith(baseUrl)) {
+        let old = hoursSince(timestamp) >= DISABLE_HOURS;
+        if (!old) {
+          return true;
+        }
+        this.contentErrors.delete(source);
+        break;
+      }
+    }
+    return false;
+  }
 }
 
 /**
@@ -76,7 +136,7 @@ const ProxyMonitor = {
 
       // If we have to many proxyInfo objects disabled we simply bypass proxy
       // entirely.
-      if (this.tooManyFailures()) {
+      if (this.tooManyFailures() || ContentMonitor.checkErrors(wrapper.finalURL)) {
         // console.log(`too many failures, remove proxies`);
         proxyInfo = null;
         return;
@@ -294,6 +354,7 @@ const monitor = {
       AddonManager.addAddonListener(this);
       if (this.hasProxyExtension()) {
         ProxyMonitor.startup();
+        ContentMonitor.startup();
       }
     }
   },
@@ -301,6 +362,7 @@ const monitor = {
   shutdown() {
     AddonManager.removeAddonListener(this);
     ProxyMonitor.shutdown();
+    ContentMonitor.shutdown();
   },
 
   observe() {
