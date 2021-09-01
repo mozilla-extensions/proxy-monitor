@@ -293,7 +293,7 @@ const ProxyMonitor = {
     );
     this.started = true;
     this.restore();
-    console.log("ProxyMonitor started");
+    log("started");
   },
 
   shutdown() {
@@ -303,7 +303,7 @@ const ProxyMonitor = {
     ProxyService.unregisterFilter(ProxyMonitor);
     this.started = false;
     this.store();
-    console.log("ProxyMonitor stopped");
+    log("stopped");
   }
 }
 
