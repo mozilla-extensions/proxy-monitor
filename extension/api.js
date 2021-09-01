@@ -13,14 +13,22 @@ XPCOMUtils.defineLazyServiceGetter(
 
 const PROXY_DIRECT = "direct";
 const DISABLE_HOURS = 48;
-const MAX_DISABLED_PI = 10;
-const MAX_DIRECT_FAILURES = 20;
+const MAX_DISABLED_PI = 5;
+const MAX_DIRECT_FAILURES = 5;
 const PREF_MONITOR_DATA = "extensions.proxyMonitor";
+const BECONSERVATIVE_SUPPORTED = Services.vc.compare(Services.appinfo.version, "93.0a1") >= 0;
 
 function hoursSince(dt2, dt1 = Date.now()) {
   var diff = (dt2 - dt1) / 1000;
   diff /= (60 * 60);
   return Math.abs(Math.round(diff));
+}
+
+const DEBUG_LOG=1
+function log(msg) {
+  if (DEBUG_LOG) {
+    console.log(`proxy-monitor: ${msg}`);
+  }
 }
 
 /**
@@ -36,6 +44,10 @@ function hoursSince(dt2, dt1 = Date.now()) {
  * 
  * 3. If too many proxy configurations get disabled, we completely disable proxies
  * for these requests.  This state remains for 48 hours.
+ * 
+ * 4. If we've removed all proxies or otherwise force a direct connection, and several
+ * of the direct connections fail, we'll try (once) proxies again to see if it was
+ * an intermittent failure.  Otherwise the above rules continue to apply.
  * 
  * If we've disabled proxies, we continue to watch the requests for failures in
  * "direct" connection mode.  If we continue to fail with direct connections,
@@ -55,31 +67,45 @@ const ProxyMonitor = {
         // If no proxy is in use, exit early.
         return;
       }
-      let wrapper = ChannelWrapper.get(channel);
-      // If this is not a system request or internal service, we will allow existing
+      // If this is not a system request we will allow existing
       // proxy behavior.
-      if (wrapper.canModify) {
+      let isSystem = BECONSERVATIVE_SUPPORTED
+        ? channel.QueryInterface(Ci.nsIHttpChannelInternal)?.beConservative 
+        : channel.loadInfo?.loadingPrincipal?.isSystemPrincipal
+      if (!isSystem) {
         return;
       }
 
       // Proxies are configured so we want to monitor for non-connection errors 
       // such as invalid proxy servers.  We also monitor for direct connection 
       // failures if we end up pruning all proxies below.
+      let wrapper = ChannelWrapper.get(channel);
       wrapper.addEventListener("error", this);
       wrapper.addEventListener("stop", this);
+
+      // We've disabled PIs but are still failing with direct connections try
+      // the proxies again for a request, it may be connectivity issues or a down server.
+      // If the request succeeds with the proxy, and it is a disabled proxy, it will
+      // get enabled again, reducing errors.size.
+      if (this.directFailures > MAX_DIRECT_FAILURES && this.errors.size) {
+        log(`too many direct connect failures, retry default proxies rid ${wrapper.id}`);
+        this.directFailures = 0;
+        return;
+      }
 
       // If we have to many proxyInfo objects disabled we simply bypass proxy
       // entirely.
       if (this.tooManyFailures()) {
-        // console.log(`too many failures, remove proxies`);
+        log(`too many proxy config failures, remove proxies and try direct rid ${wrapper.id}`);
         proxyInfo = null;
         return;
       }
-      // this.dumpProxies(proxyInfo, "starting proxyInfo");
+      this.dumpProxies(proxyInfo, `starting proxyInfo rid ${wrapper.id}`);
 
       let enabledProxies = this.pruneProxyInfo(proxyInfo);
       if (!enabledProxies.length) {
-        // No proxies are enabled, we can bail out.
+        // No proxies are left enabled, we can bail out.
+        log(`all proxies disabled, try direct`);
         proxyInfo = null;
         return;
       }
@@ -94,10 +120,10 @@ const ProxyMonitor = {
         lastFailover.failoverProxy = ProxyService.newProxyInfo(
           PROXY_DIRECT, "", 0, "", "", 0, 0, null
         );
-        // console.log(`failover: direct failover added after proxy ${lastFailover.type}:${lastFailover.host}:${lastFailover.port} for "${wrapper.finalURI.spec}"`);
+        log(`direct failover added to proxy chain rid ${wrapper.id}`);
       }
       // A little debug output
-      // this.dumpProxies(proxyInfo, "pruned proxyInfo");
+      this.dumpProxies(proxyInfo, `pruned proxyInfo rid ${wrapper.id}`);
     } finally {
       // This must be called.
       proxyFilter.onProxyFilterResult(proxyInfo);
@@ -126,20 +152,18 @@ const ProxyMonitor = {
   },
 
   dumpProxies(proxyInfo, msg) {
-    console.log(msg);
+    if (!DEBUG_LOG) {
+      return;
+    }
+    log(msg);
     let pi = proxyInfo;
     while (pi) {
-      console.log(`  ${pi.type}:${pi.host}:${pi.port}`);
+      log(`  ${pi.type}:${pi.host}:${pi.port}`);
       pi = pi.failoverProxy;
     }
   },
 
   tooManyFailures() {
-    if (this.directFailures > MAX_DIRECT_FAILURES && this.errors.size) {
-      // We've disabled PIs but are still failing with direct connections, so
-      // we reset everything and start over.
-      this.reset();
-    }
     // If we have lots of PIs that are failing in a short period of time then
     // we back off proxy for a while.
     if (this.disabledTime && hoursSince(this.disabledTime) >= DISABLE_HOURS) {
@@ -179,22 +203,17 @@ const ProxyMonitor = {
   },
 
   disableProxyInfo(proxyInfo) {
-    // this.dumpProxies(proxyInfo, "disableProxyInfo");
+    this.dumpProxies(proxyInfo, "disableProxyInfo");
     let key = this.getProxyInfoKey(proxyInfo);
     if (!key) {
       this.directFailures++;
+      log(`direct request failure ${this.directFailures}`);
       return;
     }
-    let err = this.errors.get(key);
-    if (err) {
-      err.count++;
-      err.time = Date.now();
-    } else {
-      err = { count: 1, time: Date.now() };
-    }
-    this.errors.set(key, err);
-    // If lots of proxies fail constantly, we
-    // disable for a while to ensure system
+    log(`disable ${key}`);
+    this.errors.set(key, { time: Date.now() });
+    // If lots of proxies have failed, we
+    // disable all proxies for a while to ensure system
     // requests have the best oportunity to get
     // through.
     if (this.errors.size >= MAX_DISABLED_PI) {
@@ -205,6 +224,7 @@ const ProxyMonitor = {
   enableProxyInfo(proxyInfo) {
     let key = this.getProxyInfoKey(proxyInfo);
     if (key && this.errors.has(key)) {
+      log(`enable ${key}`);
       this.errors.delete(key);
     }
   },
@@ -212,16 +232,18 @@ const ProxyMonitor = {
   handleEvent(event) {
     let wrapper = event.currentTarget; // channel wrapper
     let { channel } = wrapper;
-    if (!(channel instanceof Ci.nsIProxiedChannel) || !channel.proxyInfo) {
+    if (!(channel instanceof Ci.nsIProxiedChannel)) {
+      log(`got ${event.type} event but not a proxied channel`);
       return;
     }
 
+    log(`request event ${event.type} rid ${wrapper.id} status ${wrapper.statusCode}`);
     switch (event.type) {
       case "error":
         this.disableProxyInfo(channel.proxyInfo);
         break;
       case "stop":
-        let status = channel.statusCode;
+        let status = wrapper.statusCode;
         if (status >= 200 && status < 400) {
           this.enableProxyInfo(channel.proxyInfo);
         }
