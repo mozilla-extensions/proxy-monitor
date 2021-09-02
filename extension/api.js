@@ -14,7 +14,6 @@ XPCOMUtils.defineLazyServiceGetter(
 const PROXY_DIRECT = "direct";
 const DISABLE_HOURS = 48;
 const MAX_DISABLED_PI = 5;
-const MAX_DIRECT_FAILURES = 5;
 const PREF_MONITOR_DATA = "extensions.proxyMonitor";
 const BECONSERVATIVE_SUPPORTED = Services.vc.compare(Services.appinfo.version, "93.0a1") >= 0;
 
@@ -35,6 +34,10 @@ function log(msg) {
  * ProxyMonitor monitors system and protected requests for failures
  * due to bad or unavailable proxy configurations.
  * 
+ * In a system with multiple layers of proxy configuration, if there is a 
+ * failing proxy we try to remove just that confuration from the chain.  However if 
+ * we get too many failures, we'll make a direct connection the top "proxy".
+ * 
  * 1. Any proxied system request without a direct failover will have one added.
  * 
  * 2. If a proxied system request fails, the proxy configuration in use will
@@ -42,12 +45,11 @@ function log(msg) {
  * Disabled proxy configurations remain disabled for 48 hours to allow any necessary
  * requests to operate for a period of time.
  * 
- * 3. If too many proxy configurations get disabled, we completely disable proxies
- * for these requests.  This state remains for 48 hours.
+ * 3. If too many proxy configurations get disabled, we make a direct config first 
+ * with failover to other proxy configurations.  This state remains for 48 hours.
  * 
- * 4. If we've removed all proxies or otherwise force a direct connection, and several
- * of the direct connections fail, we'll try (once) proxies again to see if it was
- * an intermittent failure.  Otherwise the above rules continue to apply.
+ * 4. If we've removed all proxies we make a direct config first and failover to 
+ * the other proxy configurations.
  * 
  * If we've disabled proxies, we continue to watch the requests for failures in
  * "direct" connection mode.  If we continue to fail with direct connections,
@@ -57,7 +59,12 @@ const ProxyMonitor = {
   started: false,
   errors: new Map(),
   disabledTime: 0,
-  directFailures: 0,
+
+  newDirectProxyInfo() {
+    return ProxyService.newProxyInfo(
+      PROXY_DIRECT, "", 0, "", "", 0, 0, null
+    );
+  },
 
   async applyFilter(channel, defaultProxyInfo, proxyFilter) {
     let proxyInfo = defaultProxyInfo;
@@ -81,32 +88,28 @@ const ProxyMonitor = {
       // failures if we end up pruning all proxies below.
       let wrapper = ChannelWrapper.get(channel);
       wrapper.addEventListener("error", this);
-      wrapper.addEventListener("stop", this);
+      wrapper.addEventListener("start", this);
 
-      // We've disabled PIs but are still failing with direct connections try
-      // the proxies again for a request, it may be connectivity issues or a down server.
-      // If the request succeeds with the proxy, and it is a disabled proxy, it will
-      // get enabled again, reducing errors.size.
-      if (this.directFailures > MAX_DIRECT_FAILURES && this.errors.size) {
-        log(`too many direct connect failures, retry default proxies rid ${wrapper.id}`);
-        this.directFailures = 0;
-        return;
-      }
-
-      // If we have to many proxyInfo objects disabled we simply bypass proxy
-      // entirely.
+      // If we have to many proxyInfo objects disabled we try direct first and
+      // failover to the proxy config.
       if (this.tooManyFailures()) {
-        log(`too many proxy config failures, remove proxies and try direct rid ${wrapper.id}`);
-        proxyInfo = null;
+        log(`too many proxy config failures, prepend direct rid ${wrapper.id}`);
+        // A lot of failures are happening, prepend a direct proxy. If direct connections
+        // fail, the configured proxies will act as failover.
+        proxyInfo = this.newDirectProxyInfo();
+        proxyInfo.failoverProxy = defaultProxyInfo;
         return;
       }
       this.dumpProxies(proxyInfo, `starting proxyInfo rid ${wrapper.id}`);
 
       let enabledProxies = this.pruneProxyInfo(proxyInfo);
       if (!enabledProxies.length) {
-        // No proxies are left enabled, we can bail out.
-        log(`all proxies disabled, try direct`);
-        proxyInfo = null;
+        // No proxies are left enabled, prepend a direct proxy. If direct connections
+        // fail, the configured proxies will act as failover.  In this case the
+        // defaultProxyInfo chain was not changed.
+        log(`all proxies disabled, prepend direct`);
+        proxyInfo = this.newDirectProxyInfo();
+        proxyInfo.failoverProxy = defaultProxyInfo;
         return;
       }
   
@@ -117,9 +120,7 @@ const ProxyMonitor = {
         // Ensure there is always a direct failover for our critical requests.  This
         // catches connection failures such as those to non-existant or non-http ports.
         // The "error" handler added above catches http connections that are not proxy servers.
-        lastFailover.failoverProxy = ProxyService.newProxyInfo(
-          PROXY_DIRECT, "", 0, "", "", 0, 0, null
-        );
+        lastFailover.failoverProxy = this.newDirectProxyInfo();
         log(`direct failover added to proxy chain rid ${wrapper.id}`);
       }
       // A little debug output
@@ -206,9 +207,15 @@ const ProxyMonitor = {
     this.dumpProxies(proxyInfo, "disableProxyInfo");
     let key = this.getProxyInfoKey(proxyInfo);
     if (!key) {
-      this.directFailures++;
-      log(`direct request failure ${this.directFailures}`);
+      log(`direct request failure`);
       return;
+    }
+    // remove old entries
+    for (let [,err] of this.errors) {
+      if (hoursSince(err.time) >= DISABLE_HOURS) {
+        this.errors.delete(key);
+        return false;
+      }      
     }
     log(`disable ${key}`);
     this.errors.set(key, { time: Date.now() });
@@ -242,7 +249,7 @@ const ProxyMonitor = {
       case "error":
         this.disableProxyInfo(channel.proxyInfo);
         break;
-      case "stop":
+      case "start":
         let status = wrapper.statusCode;
         if (status >= 200 && status < 400) {
           this.enableProxyInfo(channel.proxyInfo);
@@ -252,14 +259,12 @@ const ProxyMonitor = {
   },
 
   reset() {
-    this.directFailures = 0;
     this.disabledTime = 0;
     this.errors = new Map();
   },
 
   store() {
     let data = JSON.stringify({
-      directFailures: this.directFailures,
       disabledTime: this.disabledTime,
       errors: Array.from(this.errors),
     });
@@ -270,7 +275,6 @@ const ProxyMonitor = {
     let failovers = Services.prefs.getStringPref(PREF_MONITOR_DATA, null);
     if (failovers) {
       failovers = JSON.parse(failovers);
-      this.directFailures = failovers.directFailures;
       this.disabledTime = failovers.disabledTime;
       this.errors = new Map(failovers.errors);
     }
