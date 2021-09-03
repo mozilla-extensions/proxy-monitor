@@ -15,7 +15,6 @@ const PROXY_DIRECT = "direct";
 const DISABLE_HOURS = 48;
 const MAX_DISABLED_PI = 5;
 const PREF_MONITOR_DATA = "extensions.proxyMonitor";
-const BECONSERVATIVE_SUPPORTED = Services.vc.compare(Services.appinfo.version, "93.0a1") >= 0;
 
 function hoursSince(dt2, dt1 = Date.now()) {
   var diff = (dt2 - dt1) / 1000;
@@ -263,6 +262,10 @@ const ProxyMonitor = {
   },
 
   store() {
+    if (!this.disabledTime && !this.errors.size) {
+      Services.prefs.clearUserPref(PREF_MONITOR_DATA);
+      return;
+    }
     let data = JSON.stringify({
       disabledTime: this.disabledTime,
       errors: Array.from(this.errors),
@@ -276,6 +279,9 @@ const ProxyMonitor = {
       failovers = JSON.parse(failovers);
       this.disabledTime = failovers.disabledTime;
       this.errors = new Map(failovers.errors);
+    } else {
+      this.disabledTime = 0;
+      this.errors = new Map();
     }
   },
 
