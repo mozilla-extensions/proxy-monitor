@@ -12,10 +12,17 @@ XPCOMUtils.defineLazyServiceGetter(
   "@mozilla.org/network/protocol-proxy-service;1",
   "nsIProtocolProxyService"
 );
+
 ChromeUtils.defineModuleGetter(
   this,
-  "AddonManager",
-  "resource://gre/modules/AddonManager.jsm"
+  "ExtensionParent",
+  "resource://gre/modules/ExtensionParent.jsm",
+);
+
+XPCOMUtils.defineLazyGetter(
+  this,
+  "Management",
+  () => ExtensionParent.apiManager
 );
 ChromeUtils.defineModuleGetter(
   this,
