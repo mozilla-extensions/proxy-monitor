@@ -66,9 +66,9 @@ const ProxyMonitor = {
   errors: new Map(),
   disabledTime: 0,
 
-  newDirectProxyInfo() {
+  newDirectProxyInfo(failover = null) {
     return ProxyService.newProxyInfo(
-      PROXY_DIRECT, "", 0, "", "", 0, 0, null
+      PROXY_DIRECT, "", 0, "", "", 0, 0, failover
     );
   },
 
@@ -82,10 +82,7 @@ const ProxyMonitor = {
       }
       // If this is not a system request we will allow existing
       // proxy behavior.
-      let isSystem = BECONSERVATIVE_SUPPORTED
-        ? channel.QueryInterface(Ci.nsIHttpChannelInternal)?.beConservative 
-        : channel.loadInfo?.loadingPrincipal?.isSystemPrincipal
-      if (!isSystem) {
+      if (!channel.loadInfo?.loadingPrincipal?.isSystemPrincipal) {
         return;
       }
 
@@ -102,8 +99,7 @@ const ProxyMonitor = {
         log(`too many proxy config failures, prepend direct rid ${wrapper.id}`);
         // A lot of failures are happening, prepend a direct proxy. If direct connections
         // fail, the configured proxies will act as failover.
-        proxyInfo = this.newDirectProxyInfo();
-        proxyInfo.failoverProxy = defaultProxyInfo;
+        proxyInfo = this.newDirectProxyInfo(defaultProxyInfo);
         return;
       }
       this.dumpProxies(proxyInfo, `starting proxyInfo rid ${wrapper.id}`);
@@ -114,8 +110,7 @@ const ProxyMonitor = {
         // fail, the configured proxies will act as failover.  In this case the
         // defaultProxyInfo chain was not changed.
         log(`all proxies disabled, prepend direct`);
-        proxyInfo = this.newDirectProxyInfo();
-        proxyInfo.failoverProxy = defaultProxyInfo;
+        proxyInfo = this.newDirectProxyInfo(defaultProxyInfo);
         return;
       }
   
@@ -217,11 +212,10 @@ const ProxyMonitor = {
       return;
     }
     // remove old entries
-    for (let [,err] of this.errors) {
+    for (let [k ,err] of this.errors) {
       if (hoursSince(err.time) >= DISABLE_HOURS) {
-        this.errors.delete(key);
-        return false;
-      }      
+        this.errors.delete(k);
+      }
     }
     log(`disable ${key}`);
     this.errors.set(key, { time: Date.now() });
