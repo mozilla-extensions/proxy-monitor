@@ -4,6 +4,8 @@ const { XPCOMUtils } = ChromeUtils.import(
   "resource://gre/modules/XPCOMUtils.jsm"
 );
 XPCOMUtils.defineLazyGlobalGetters(this, ["ChannelWrapper"]);
+const { WebExtensionPolicy } = Cu.getGlobalForObject(Services);
+
 XPCOMUtils.defineLazyServiceGetter(
   this,
   "ProxyService",
@@ -11,10 +13,23 @@ XPCOMUtils.defineLazyServiceGetter(
   "nsIProtocolProxyService"
 );
 
+ChromeUtils.defineModuleGetter(
+  this,
+  "ExtensionParent",
+  "resource://gre/modules/ExtensionParent.jsm",
+);
+
+XPCOMUtils.defineLazyGetter(
+  this,
+  "Management",
+  () => ExtensionParent.apiManager
+);
+
 const PROXY_DIRECT = "direct";
 const DISABLE_HOURS = 48;
 const MAX_DISABLED_PI = 5;
 const PREF_MONITOR_DATA = "extensions.proxyMonitor";
+const PREF_PROXY_FAILOVER = "network.proxy.failover_direct";
 
 function hoursSince(dt2, dt1 = Date.now()) {
   var diff = (dt2 - dt1) / 1000;
@@ -60,7 +75,6 @@ function log(msg) {
  * we fall back to allowing proxies again.
  */
 const ProxyMonitor = {
-  started: false,
   errors: new Map(),
   disabledTime: 0,
 
@@ -286,34 +300,136 @@ const ProxyMonitor = {
   },
 
   startup() {
-    if (this.started) {
-      return;
-    }
     // Register filter with a very high position, this will sort to the last filter called.
     ProxyService.registerChannelFilter(
       ProxyMonitor,
       Number.MAX_SAFE_INTEGER
     );
-    this.started = true;
     this.restore();
+    log("started");
   },
 
   shutdown() {
-    if (!this.started) {
-      return;
-    }
     ProxyService.unregisterFilter(ProxyMonitor);
-    this.started = false;
     this.store();
-
+    log("stopped");
   }
 }
 
+/**
+ * Listen for changes in addons and pref to start or stop the ProxyMonitor.
+ */
+const monitor = {
+  running: false,
+
+  startup() {
+    if (!this.failoverEnabled) {
+      return;
+    }
+
+    Management.on("startup", this.handleEvent);
+    Management.on("shutdown", this.handleEvent);
+    Management.on("change-permissions", this.handleEvent);
+    if (this.hasProxyExtension()) {
+      monitor.startMonitors();
+    }
+  },
+
+  shutdown() {
+    Management.off("startup", this.handleEvent);
+    Management.off("shutdown", this.handleEvent);
+    Management.off("change-permissions", this.handleEvent);
+    monitor.stopMonitors();
+  },
+
+  get failoverEnabled() {
+    return Services.prefs.getBoolPref(PREF_PROXY_FAILOVER, true);
+  },
+
+  observe() {
+    if (monitor.failoverEnabled) {
+      monitor.startup();
+    } else {
+      monitor.shutdown();
+    }
+  },
+
+  startMonitors() {
+    if (!monitor.running) {
+      ProxyMonitor.startup();
+      monitor.running = true;
+    }
+  },
+
+  stopMonitors() {
+    if (monitor.running) {
+      ProxyMonitor.shutdown();
+      monitor.running = false;
+    }
+  },
+
+  hasProxyExtension(ignore) {
+    for (let policy of WebExtensionPolicy.getActiveExtensions()) {
+      if (policy.id != ignore 
+          && !policy.extension?.isAppProvided 
+          && policy.hasPermission("proxy")) {
+        return true;
+      }
+    }
+    return false;
+  },
+
+  handleEvent(kind, ...args) {
+    switch (kind) {
+      case "startup": {
+        let [extension] = args;
+        if (!monitor.running 
+            && !extension.isAppProvided 
+            && extension.hasPermission("proxy")) {
+          monitor.startMonitors();
+        }
+        break;
+      }
+      case "shutdown": {
+        if (Services.startup.shuttingDown) {
+          // Let normal shutdown handle things.
+          break;
+        }
+        let [extension] = args;
+        // Policy is still active, pass the id to ignore it.
+        if (monitor.running 
+            && !extension.isAppProvided 
+            && !monitor.hasProxyExtension(extension.id)) {
+          monitor.stopMonitors();
+        }
+        break;
+      }
+      case "change-permissions": {
+        if (monitor.running) {
+          break;
+        }
+        let { extensionId, added } = args[0];
+        if (!added?.permissions.includes("proxy")) {
+          return;
+        }
+        let extension = WebExtensionPolicy.getByID(extensionId)?.extension;
+        if (extension && !extension.isAppProvided) {
+          monitor.startMonitors();
+        }
+        break;
+      }
+    }
+  },
+};
+
 this.failover = class extends ExtensionAPI {
   onStartup() {
-    ProxyMonitor.startup();
+    monitor.startup();
+    Services.prefs.addObserver(PREF_PROXY_FAILOVER, monitor);
   }
+
   onShutdown() {
-    ProxyMonitor.shutdown();
+    monitor.shutdown();
+    Services.prefs.removeObserver(PREF_PROXY_FAILOVER, monitor);
   }
 };
