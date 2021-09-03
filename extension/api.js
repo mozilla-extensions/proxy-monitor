@@ -391,6 +391,10 @@ const monitor = {
         break;
       }
       case "shutdown": {
+        if (Services.startup.shuttingDown) {
+          // Let normal shutdown handle things.
+          break;
+        }
         let [extension] = args;
         // Policy is still active, pass the id to ignore it.
         if (monitor.running 
@@ -405,11 +409,14 @@ const monitor = {
           break;
         }
         let { extensionId, added } = args[0];
-        let policy = WebExtensionPolicy.getByID(extensionId);
-        if (!policy?.extension?.isAppProvided 
-            && added?.permissions.includes("proxy")) {
+        if (!added?.permissions.includes("proxy")) {
+          return;
+        }
+        let extension = WebExtensionPolicy.getByID(extensionId)?.extension;
+        if (extension && !extension.isAppProvided) {
           monitor.startMonitors();
         }
+        break;
       }
     }
   },
