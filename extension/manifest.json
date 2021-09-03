@@ -1,0 +1,22 @@
+{
+  "manifest_version": 2,
+  "name": "Proxy Failover",
+  "applications": {
+    "gecko": {
+      "id": "proxy-failover@mozilla.com",
+      "strict_min_version": "87.0"
+    }
+  },
+  "version": "1.0.0",
+  "description": "Direct Failover for system requests.",
+  "experiment_apis": {
+    "failover": {
+      "schema": "schema.json",
+      "parent": {
+        "scopes": ["addon_parent"],
+        "script": "api.js",
+        "events": ["startup"]
+      }
+    }
+  }
+}
