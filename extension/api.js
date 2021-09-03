@@ -3,17 +3,26 @@ const { Services } = ChromeUtils.import("resource://gre/modules/Services.jsm");
 const { XPCOMUtils } = ChromeUtils.import(
   "resource://gre/modules/XPCOMUtils.jsm"
 );
-XPCOMUtils.defineLazyGlobalGetters(this, ["ChannelWrapper", "WebExtensionPolicy"]);
+XPCOMUtils.defineLazyGlobalGetters(this, ["ChannelWrapper"]);
+const { WebExtensionPolicy } = Cu.getGlobalForObject(Services);
+
 XPCOMUtils.defineLazyServiceGetter(
   this,
   "ProxyService",
   "@mozilla.org/network/protocol-proxy-service;1",
   "nsIProtocolProxyService"
 );
+
 ChromeUtils.defineModuleGetter(
   this,
-  "AddonManager",
-  "resource://gre/modules/AddonManager.jsm"
+  "ExtensionParent",
+  "resource://gre/modules/ExtensionParent.jsm",
+);
+
+XPCOMUtils.defineLazyGetter(
+  this,
+  "Management",
+  () => ExtensionParent.apiManager
 );
 ChromeUtils.defineModuleGetter(
   this,
@@ -26,7 +35,6 @@ const DISABLE_HOURS = 48;
 const MAX_DISABLED_PI = 5;
 const PREF_MONITOR_DATA = "extensions.proxyMonitor";
 const PREF_PROXY_FAILOVER = "network.proxy.failover_direct";
-const BECONSERVATIVE_SUPPORTED = Services.vc.compare(Services.appinfo.version, "93.0a1") >= 0;
 
 const PROXY_CONFIG_TYPES = [
   "direct",
@@ -62,20 +70,24 @@ function log(msg) {
  * 2. If a proxied system request fails, the proxy configuration in use will
  * be disabled.  On later requests, disabled proxies are removed from the proxy chain.
  * Disabled proxy configurations remain disabled for 48 hours to allow any necessary
- * requests to operate for a period of time.
+ * requests to operate for a period of time. When disabled proxies are used as a
+ * failover to a direct request (step 3 or 4 below), the proxy can be detected
+ * as functional and be re-enabled despite not having reached the 48 hours.
+ * Likewise, if the proxy fails again it is disabled for another 48 hours.
  * 
- * 3. If too many proxy configurations get disabled, we make a direct config first 
- * with failover to other proxy configurations.  This state remains for 48 hours.
+ * 3. If too many proxy configurations got disabled, we make a direct config first
+ * with failover to all other proxy configurations (essentially skipping step 2).
+ * This state remains for 48 hours and can be extended if the failure condition
+ * is detected again, i.e. when 5 distinct proxies fail within 48 hours.
  * 
  * 4. If we've removed all proxies we make a direct config first and failover to 
- * the other proxy configurations.
+ * the other proxy configurations, similar to step 3.
  * 
  * If we've disabled proxies, we continue to watch the requests for failures in
  * "direct" connection mode.  If we continue to fail with direct connections,
  * we fall back to allowing proxies again.
  */
 const ProxyMonitor = {
-  started: false,
   errors: new Map(),
   disabledTime: 0,
 
@@ -346,6 +358,10 @@ const ProxyMonitor = {
   },
 
   store() {
+    if (!this.disabledTime && !this.errors.size) {
+      Services.prefs.clearUserPref(PREF_MONITOR_DATA);
+      return;
+    }
     let data = JSON.stringify({
       disabledTime: this.disabledTime,
       errors: Array.from(this.errors),
@@ -359,29 +375,24 @@ const ProxyMonitor = {
       failovers = JSON.parse(failovers);
       this.disabledTime = failovers.disabledTime;
       this.errors = new Map(failovers.errors);
+    } else {
+      this.disabledTime = 0;
+      this.errors = new Map();
     }
   },
 
   startup() {
-    if (this.started) {
-      return;
-    }
     // Register filter with a very high position, this will sort to the last filter called.
     ProxyService.registerChannelFilter(
       ProxyMonitor,
       Number.MAX_SAFE_INTEGER
     );
-    this.started = true;
     this.restore();
     log("started");
   },
 
   shutdown() {
-    if (!this.started) {
-      return;
-    }
     ProxyService.unregisterFilter(ProxyMonitor);
-    this.started = false;
     this.store();
     log("stopped");
   }
@@ -391,18 +402,30 @@ const ProxyMonitor = {
  * Listen for changes in addons and pref to start or stop the ProxyMonitor.
  */
 const monitor = {
+  running: false,
+
   startup() {
-    if (this.failoverEnabled) {
-      AddonManager.addAddonListener(this);
-      if (this.hasProxyExtension()) {
-        ProxyMonitor.startup();
-      }
+    if (!this.failoverEnabled) {
+      return;
+    }
+
+    Management.on("startup", this.handleEvent);
+    Management.on("shutdown", this.handleEvent);
+    Management.on("change-permissions", this.handleEvent);
+    if (this.hasProxyExtension()) {
+      monitor.startMonitors();
     }
   },
 
   shutdown() {
-    AddonManager.removeAddonListener(this);
-    ProxyMonitor.shutdown();
+    Management.off("startup", this.handleEvent);
+    Management.off("shutdown", this.handleEvent);
+    Management.off("change-permissions", this.handleEvent);
+    monitor.stopMonitors();
+  },
+
+  get failoverEnabled() {
+    return Services.prefs.getBoolPref(PREF_PROXY_FAILOVER, true);
   },
 
   observe() {
@@ -413,46 +436,63 @@ const monitor = {
     }
   },
 
-  hasProxyExtension() {
+  startMonitors() {
+    if (!monitor.running) {
+      ProxyMonitor.startup();
+      monitor.running = true;
+    }
+  },
+
+  stopMonitors() {
+    if (monitor.running) {
+      ProxyMonitor.shutdown();
+      monitor.running = false;
+    }
+  },
+
+  hasProxyExtension(ignore) {
     for (let policy of WebExtensionPolicy.getActiveExtensions()) {
-      if (policy.hasPermission("proxy")) {
+      if (policy.id != ignore 
+          && !policy.extension?.isAppProvided 
+          && policy.hasPermission("proxy")) {
         return true;
       }
     }
     return false;
   },
 
-  get failoverEnabled() {
-    return Services.prefs.getBoolPref(PREF_PROXY_FAILOVER, true);
-  },
-
-  shouldMonitor(addon) {
-    return addon.type == "extension" 
-      && !addon.isSystem 
-      && WebExtensionPolicy.getByID(addon.id).hasPermission("proxy");
-  },
-
-  onEnabled(addon) {
-    if (this.shouldMonitor(addon)) {
-      ProxyMonitor.startup();
-    }
-  },
-
-  onDisabled(addon) {
-    if (!this.hasProxyExtension()) {
-      ProxyMonitor.shutdown();
-    }
-  },
-
-  onInstalled(addon) {
-    if (this.shouldMonitor(addon)) {
-      ProxyMonitor.startup();
-    }
-  },
-
-  onUninstalled(addon) {
-    if (!this.hasProxyExtension()) {
-      ProxyMonitor.shutdown();
+  handleEvent(kind, ...args) {
+    switch (kind) {
+      case "startup": {
+        let [extension] = args;
+        if (!monitor.running 
+            && !extension.isAppProvided 
+            && extension.hasPermission("proxy")) {
+          monitor.startMonitors();
+        }
+        break;
+      }
+      case "shutdown": {
+        let [extension] = args;
+        // Policy is still active, pass the id to ignore it.
+        if (monitor.running 
+            && !extension.isAppProvided 
+            && !monitor.hasProxyExtension(extension.id)) {
+          monitor.stopMonitors();
+        }
+        break;
+      }
+      case "change-permissions": {
+        if (monitor.running) {
+          break;
+        }
+        let { extensionId, added } = args[0];
+        let policy = WebExtensionPolicy.getByID(extensionId);
+        if (!policy?.extension?.isAppProvided 
+            && added?.permissions.includes("proxy")) {
+          monitor.startMonitors();
+        }
+      }
     }
   },
 };
