@@ -15,6 +15,11 @@ ChromeUtils.defineModuleGetter(
   "AddonManager",
   "resource://gre/modules/AddonManager.jsm"
 );
+ChromeUtils.defineModuleGetter(
+  this,
+  "ExtensionPreferencesManager",
+  "resource://gre/modules/ExtensionPreferencesManager.jsm"
+);
 
 const PROXY_DIRECT = "direct";
 const DISABLE_HOURS = 48;
@@ -22,6 +27,14 @@ const MAX_DISABLED_PI = 5;
 const PREF_MONITOR_DATA = "extensions.proxyMonitor";
 const PREF_PROXY_FAILOVER = "network.proxy.failover_direct";
 const BECONSERVATIVE_SUPPORTED = Services.vc.compare(Services.appinfo.version, "93.0a1") >= 0;
+
+const PROXY_CONFIG_TYPES = [
+  "direct",
+  "manual",
+  "pac",
+  "wpad",
+  "system"
+];
 
 function hoursSince(dt2, dt1 = Date.now()) {
   var diff = (dt2 - dt1) / 1000;
@@ -174,6 +187,7 @@ const ProxyMonitor = {
     // If we have lots of PIs that are failing in a short period of time then
     // we back off proxy for a while.
     if (this.disabledTime && hoursSince(this.disabledTime) >= DISABLE_HOURS) {
+      this.recordEvent("timeout", "proxyBypass");
       this.reset();
     }
     return !!this.disabledTime;
@@ -194,6 +208,7 @@ const ProxyMonitor = {
     // our daily update checks time to complete again.
     if (hoursSince(err.time) >= DISABLE_HOURS) {
       this.errors.delete(key);
+      this.recordEvent("timeout", "proxyInfo");
       return false;
     }
 
@@ -209,6 +224,69 @@ const ProxyMonitor = {
     return `${type}:${host}:${port}`;
   },
 
+  async getProxySource(proxyInfo) {
+    try {
+      // sourceId is set when using proxy.onRequest
+      if (proxyInfo.sourceId) {
+        return {
+          source: proxyInfo.sourceId,
+          type: "api"
+        };
+      }
+    } catch(e) {
+      // sourceId fx92 and later, otherwise exception.
+    }
+    let type = PROXY_CONFIG_TYPES[ProxyService.proxyConfigType] || "unknown";
+    let source;
+    // Is this proxied by an extension that set proxy prefs?
+    let setting = await ExtensionPreferencesManager.getSetting("proxy.settings");
+    if (setting) {
+      let levelOfControl = await ExtensionPreferencesManager.getLevelOfControl(
+        setting.id,
+        "proxy.settings"
+      );
+      if (levelOfControl == "controlled_by_this_extension") {
+        source = setting.id;
+      }
+    }
+    // If we have a policy it will have set the prefs.
+    if (Services.policies.status === Services.policies.ACTIVE) {
+      let policies = Services.policies.getActivePolicies()?.filter(p => p.Proxy);
+      if (policies?.length) {
+        return {
+          source: "policy",
+          type,
+        };
+      }
+    }
+    return {
+      source: source || "prefs",
+      type,
+    };
+  },
+
+  async logProxySource(state, proxyInfo) {
+    let { source, type } = await this.getProxySource(proxyInfo);
+    this.recordEvent(state, "proxyInfo", type, { source });
+  },
+
+  recordEvent(method, obj, type = null, source = {}) {
+    try {
+      Services.telemetry.recordEvent(
+        "proxyMonitor",
+        method,
+        obj,
+        type,
+        source
+      );
+      log(`event: ${method} ${obj} ${type} ${JSON.stringify(source)}`);
+    } catch (err) {
+      // If the telemetry throws just log the error so it doesn't break any
+      // functionality.
+      Cu.reportError(err);
+    }
+  },
+
   disableProxyInfo(proxyInfo) {
     this.dumpProxies(proxyInfo, "disableProxyInfo");
     let key = this.getProxyInfoKey(proxyInfo);
@@ -221,24 +299,28 @@ const ProxyMonitor = {
       if (hoursSince(err.time) >= DISABLE_HOURS) {
         this.errors.delete(key);
         return false;
-      }      
+      }
     }
-    log(`disable ${key}`);
+    if (this.errors.has(key)) {
+      return;
+    }
     this.errors.set(key, { time: Date.now() });
+    this.logProxySource("disabled", proxyInfo);
     // If lots of proxies have failed, we
     // disable all proxies for a while to ensure system
     // requests have the best oportunity to get
     // through.
-    if (this.errors.size >= MAX_DISABLED_PI) {
+    if (!this.disabledTime && this.errors.size >= MAX_DISABLED_PI) {
       this.disabledTime = Date.now();
+      this.recordEvent("start", "proxyBypass");
     }
   },
 
   enableProxyInfo(proxyInfo) {
     let key = this.getProxyInfoKey(proxyInfo);
     if (key && this.errors.has(key)) {
-      log(`enable ${key}`);
       this.errors.delete(key);
+      this.logProxySource("enabled", proxyInfo);
     }
   },
 
@@ -383,6 +465,18 @@ const monitor = {
 
 this.failover = class extends ExtensionAPI {
   onStartup() {
+    Services.telemetry.registerEvents("proxyMonitor", {
+      proxyMonitor: {
+        methods: ["enabled", "disabled", "start", "timeout"],
+        objects: [
+          "proxyInfo",
+          "proxyBypass"
+        ],
+        extra_keys: ["source"],
+        record_on_release: true,
+      },
+    });
+
     monitor.startup();
     Services.prefs.addObserver(PREF_PROXY_FAILOVER, monitor);
   }
