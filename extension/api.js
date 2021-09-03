@@ -43,13 +43,18 @@ function log(msg) {
  * 2. If a proxied system request fails, the proxy configuration in use will
  * be disabled.  On later requests, disabled proxies are removed from the proxy chain.
  * Disabled proxy configurations remain disabled for 48 hours to allow any necessary
- * requests to operate for a period of time.
+ * requests to operate for a period of time. When disabled proxies are used as a
+ * failover to a direct request (step 3 or 4 below), the proxy can be detected
+ * as functional and be re-enabled despite not having reached the 48 hours.
+ * Likewise, if the proxy fails again it is disabled for another 48 hours.
  * 
- * 3. If too many proxy configurations get disabled, we make a direct config first 
- * with failover to other proxy configurations.  This state remains for 48 hours.
+ * 3. If too many proxy configurations got disabled, we make a direct config first
+ * with failover to all other proxy configurations (essentially skipping step 2).
+ * This state remains for 48 hours and can be extended if the failure condition
+ * is detected again, i.e. when 5 distinct proxies fail within 48 hours.
  * 
  * 4. If we've removed all proxies we make a direct config first and failover to 
- * the other proxy configurations.
+ * the other proxy configurations, similar to step 3.
  * 
  * If we've disabled proxies, we continue to watch the requests for failures in
  * "direct" connection mode.  If we continue to fail with direct connections,
