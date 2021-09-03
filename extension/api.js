@@ -76,10 +76,7 @@ const ProxyMonitor = {
       }
       // If this is not a system request we will allow existing
       // proxy behavior.
-      let isSystem = BECONSERVATIVE_SUPPORTED
-        ? channel.QueryInterface(Ci.nsIHttpChannelInternal)?.beConservative 
-        : channel.loadInfo?.loadingPrincipal?.isSystemPrincipal
-      if (!isSystem) {
+      if (!channel.loadInfo?.loadingPrincipal?.isSystemPrincipal) {
         return;
       }
 
