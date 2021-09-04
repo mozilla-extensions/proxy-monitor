@@ -243,6 +243,22 @@ const ProxyMonitor = {
     return `${type}:${host}:${port}`;
   },
 
+  // If proxy.settings is used to change the proxy, an extension will
+  // be "in control".  This returns the id of that extension.
+  async getControllingExtension() {
+    // Is this proxied by an extension that set proxy prefs?
+    let setting = await ExtensionPreferencesManager.getSetting("proxy.settings");
+    if (setting) {
+      let levelOfControl = await ExtensionPreferencesManager.getLevelOfControl(
+        setting.id,
+        "proxy.settings"
+      );
+      if (levelOfControl == "controlled_by_this_extension") {
+        return setting.id;
+      }
+    }
+  },
+
   async getProxySource(proxyInfo) {
     try {
       // sourceId is set when using proxy.onRequest
@@ -256,18 +272,7 @@ const ProxyMonitor = {
       // sourceId fx92 and later, otherwise exception.
     }
     let type = PROXY_CONFIG_TYPES[ProxyService.proxyConfigType] || "unknown";
-    let source;
-    // Is this proxied by an extension that set proxy prefs?
-    let setting = await ExtensionPreferencesManager.getSetting("proxy.settings");
-    if (setting) {
-      let levelOfControl = await ExtensionPreferencesManager.getLevelOfControl(
-        setting.id,
-        "proxy.settings"
-      );
-      if (levelOfControl == "controlled_by_this_extension") {
-        source = setting.id;
-      }
-    }
+
     // If we have a policy it will have set the prefs.
     if (Services.policies.status === Services.policies.ACTIVE) {
       let policies = Services.policies.getActivePolicies()?.filter(p => p.Proxy);
@@ -278,6 +283,8 @@ const ProxyMonitor = {
         };
       }
     }
+
+    let source = await this.getControllingExtension();
     return {
       source: source || "prefs",
       type,
@@ -487,7 +494,7 @@ const monitor = {
           break;
         }
         let [extension] = args;
-        // Policy is still active, pass the id to ignore it.
+        // WebExtensionPolicy is still active, pass the id to ignore it.
         if (monitor.running 
             && !extension.isAppProvided 
             && !monitor.hasProxyExtension(extension.id)) {
