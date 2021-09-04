@@ -1,4 +1,3 @@
-
 const { Services } = ChromeUtils.import("resource://gre/modules/Services.jsm");
 const { XPCOMUtils } = ChromeUtils.import(
   "resource://gre/modules/XPCOMUtils.jsm"
@@ -86,12 +85,10 @@ function log(msg) {
  * requests to operate for a period of time. When disabled proxies are used as a
  * failover to a direct request (step 3 or 4 below), the proxy can be detected
  * as functional and be re-enabled despite not having reached the 48 hours.
- * Likewise, if the proxy fails again it is disabled for another 48 hours.
  * 
  * 3. If too many proxy configurations got disabled, we make a direct config first
  * with failover to all other proxy configurations (essentially skipping step 2).
- * This state remains for 48 hours and can be extended if the failure condition
- * is detected again, i.e. when 5 distinct proxies fail within 48 hours.
+ * This state remains for 48 hours before retrying without "direct".
  * 
  * 4. If we've removed all proxies we make a direct config first and failover to 
  * the other proxy configurations, similar to step 3.
@@ -252,7 +249,7 @@ const ProxyMonitor = {
     // our daily update checks time to complete again.
     if (hoursSince(err.time) >= DISABLE_HOURS) {
       this.errors.delete(key);
-      this.recordEvent("timeout", "proxyInfo");
+      this.logProxySource("timeout", proxyInfo);
       return false;
     }
 
@@ -273,28 +270,16 @@ const ProxyMonitor = {
   async getControllingExtension() {
     // Is this proxied by an extension that set proxy prefs?
     let setting = await ExtensionPreferencesManager.getSetting("proxy.settings");
-    if (setting) {
-      let levelOfControl = await ExtensionPreferencesManager.getLevelOfControl(
-        setting.id,
-        "proxy.settings"
-      );
-      if (levelOfControl == "controlled_by_this_extension") {
-        return setting.id;
-      }
-    }
+    return setting?.id;
   },
 
   async getProxySource(proxyInfo) {
-    try {
       // sourceId is set when using proxy.onRequest
-      if (proxyInfo.sourceId) {
-        return {
-          source: proxyInfo.sourceId,
-          type: "api"
-        };
-      }
-    } catch(e) {
-      // sourceId fx92 and later, otherwise exception.
+    if (proxyInfo.sourceId) {
+      return {
+        source: proxyInfo.sourceId,
+        type: "api"
+      };
     }
     let type = PROXY_CONFIG_TYPES[ProxyService.proxyConfigType] || "unknown";
 
@@ -349,6 +334,7 @@ const ProxyMonitor = {
     for (let [k ,err] of this.errors) {
       if (hoursSince(err.time) >= DISABLE_HOURS) {
         this.errors.delete(k);
+        this.recordEvent("timeout", "proxyInfo");
       }
     }
     this.errors.set(key, { time: Date.now() });
