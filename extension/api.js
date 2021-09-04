@@ -1,4 +1,3 @@
-
 const { Services } = ChromeUtils.import("resource://gre/modules/Services.jsm");
 const { XPCOMUtils } = ChromeUtils.import(
   "resource://gre/modules/XPCOMUtils.jsm"
@@ -24,12 +23,37 @@ XPCOMUtils.defineLazyGetter(
   "Management",
   () => ExtensionParent.apiManager
 );
+ChromeUtils.defineModuleGetter(
+  this,
+  "ExtensionPreferencesManager",
+  "resource://gre/modules/ExtensionPreferencesManager.jsm"
+);
+
+ChromeUtils.defineModuleGetter(
+  this,
+  "ExtensionParent",
+  "resource://gre/modules/ExtensionParent.jsm",
+);
+
+XPCOMUtils.defineLazyGetter(
+  this,
+  "Management",
+  () => ExtensionParent.apiManager
+);
 
 const PROXY_DIRECT = "direct";
 const DISABLE_HOURS = 48;
 const MAX_DISABLED_PI = 5;
 const PREF_MONITOR_DATA = "extensions.proxyMonitor";
 const PREF_PROXY_FAILOVER = "network.proxy.failover_direct";
+
+const PROXY_CONFIG_TYPES = [
+  "direct",
+  "manual",
+  "pac",
+  "wpad",
+  "system"
+];
 
 function hoursSince(dt2, dt1 = Date.now()) {
   var diff = (dt2 - dt1) / 1000;
@@ -60,12 +84,10 @@ function log(msg) {
  * requests to operate for a period of time. When disabled proxies are used as a
  * failover to a direct request (step 3 or 4 below), the proxy can be detected
  * as functional and be re-enabled despite not having reached the 48 hours.
- * Likewise, if the proxy fails again it is disabled for another 48 hours.
  * 
  * 3. If too many proxy configurations got disabled, we make a direct config first
  * with failover to all other proxy configurations (essentially skipping step 2).
- * This state remains for 48 hours and can be extended if the failure condition
- * is detected again, i.e. when 5 distinct proxies fail within 48 hours.
+ * This state remains for 48 hours before retrying without "direct".
  * 
  * 4. If we've removed all proxies we make a direct config first and failover to 
  * the other proxy configurations, similar to step 3.
@@ -98,44 +120,33 @@ const ProxyMonitor = {
         return;
       }
 
-      // Proxies are configured so we want to monitor for non-connection errors 
-      // such as invalid proxy servers.  We also monitor for direct connection 
-      // failures if we end up pruning all proxies below.
+      // We monitor for successful connections which in some cases may 
+      // re-enable a prior failed proxy configuration.
       let wrapper = ChannelWrapper.get(channel);
-      wrapper.addEventListener("error", this);
       wrapper.addEventListener("start", this);
 
-      // If we have to many proxyInfo objects disabled we try direct first and
-      // failover to the proxy config.
       if (this.tooManyFailures()) {
         log(`too many proxy config failures, prepend direct rid ${wrapper.id}`);
-        // A lot of failures are happening, prepend a direct proxy. If direct connections
-        // fail, the configured proxies will act as failover.
-        proxyInfo = this.newDirectProxyInfo(defaultProxyInfo);
+        // A lot of failures are happening.  Try direct first, but failover to 
+        // any non-extension proxies "just in case".
+        proxyInfo = this.newDirectProxyInfo(await this.pruneExtensions(defaultProxyInfo));
         return;
       }
       this.dumpProxies(proxyInfo, `starting proxyInfo rid ${wrapper.id}`);
 
-      let enabledProxies = this.pruneProxyInfo(proxyInfo);
-      if (!enabledProxies.length) {
-        // No proxies are left enabled, prepend a direct proxy. If direct connections
-        // fail, the configured proxies will act as failover.  In this case the
-        // defaultProxyInfo chain was not changed.
+      proxyInfo = this.pruneProxyInfo(proxyInfo);
+      if (!proxyInfo) {
+        // All current proxies are disabled due to prior failures.  Try direct
+        // first, but failover to any non-extension proxies "just in case".
         log(`all proxies disabled, prepend direct`);
-        proxyInfo = this.newDirectProxyInfo(defaultProxyInfo);
+        proxyInfo = this.newDirectProxyInfo(await this.pruneExtensions(defaultProxyInfo));
         return;
       }
-  
-      proxyInfo = enabledProxies[0];
-      let lastFailover = enabledProxies.pop();
 
-      if (lastFailover.failoverProxy || lastFailover.type != PROXY_DIRECT) {
-        // Ensure there is always a direct failover for our critical requests.  This
-        // catches connection failures such as those to non-existant or non-http ports.
-        // The "error" handler added above catches http connections that are not proxy servers.
-        lastFailover.failoverProxy = this.newDirectProxyInfo();
-        log(`direct failover added to proxy chain rid ${wrapper.id}`);
-      }
+      // If we are not attempting a direct bypass we want to monitor for non-connection errors 
+      // such as invalid proxy servers.  
+      wrapper.addEventListener("error", this);
+
       // A little debug output
       this.dumpProxies(proxyInfo, `pruned proxyInfo rid ${wrapper.id}`);
     } finally {
@@ -144,6 +155,44 @@ const ProxyMonitor = {
     }
   },
 
+  relinkProxyInfoChain(proxies) {
+    if (!proxies.length) {
+      return null;
+    }
+    // Re-link the proxy chain.
+    // failoverProxy cannot be set to undefined or null, we fixup the last failover
+    // with a direct failover if necessary.
+    for (let i = 0; i < proxies.length - 2; i++) {
+      proxies[i].failoverProxy = proxies[i + 1];
+    }
+    let last = proxies.pop();
+    // Ensure the last proxy is not linked to something we removed.  This
+    // catches connection failures such as those to non-existant or non-http ports.
+    // The "error" handler added above catches http connections that are not proxy servers.
+    if (last.failoverProxy || last.type != PROXY_DIRECT) {
+      last.failoverProxy = this.newDirectProxyInfo();
+    }
+    return proxies[0];
+  },
+
+  async pruneExtensions(proxyInfo) {
+    // If an extension controls the settings, we must assume that all PIs
+    // came from the extension.
+    let extensionId = await this.getControllingExtension();
+    if (extensionId) {
+      return null;
+    }
+    let enabledProxies = [];
+    let pi = proxyInfo;
+    while (pi) {
+      if (!pi.sourceId) {
+        enabledProxies.push(pi);
+      }
+      pi = pi.failoverProxy;
+    }
+    return this.relinkProxyInfoChain(enabledProxies);
+  },
+  
   // Verify the entire proxy failover chain is clean.  There may be multiple
   // sources for proxyInfo in the chain, so we remove any disabled entries
   // and continue to use configurations that have not yet failed.
@@ -156,13 +205,7 @@ const ProxyMonitor = {
       }
       pi = pi.failoverProxy;
     }
-    // Re-link the proxy chain.
-    // failoverProxy cannot be set to undefined or null, we fixup the last failover
-    // later with a direct failover if necessary.
-    for (let i = 0; i < enabledProxies.length - 2; i++) {
-      enabledProxies[i].failoverProxy = enabledProxies[i + 1];
-    }
-    return enabledProxies;
+    return this.relinkProxyInfoChain(enabledProxies);
   },
 
   dumpProxies(proxyInfo, msg) {
@@ -181,6 +224,7 @@ const ProxyMonitor = {
     // If we have lots of PIs that are failing in a short period of time then
     // we back off proxy for a while.
     if (this.disabledTime && hoursSince(this.disabledTime) >= DISABLE_HOURS) {
+      this.recordEvent("timeout", "proxyBypass");
       this.reset();
     }
     return !!this.disabledTime;
@@ -201,6 +245,7 @@ const ProxyMonitor = {
     // our daily update checks time to complete again.
     if (hoursSince(err.time) >= DISABLE_HOURS) {
       this.errors.delete(key);
+      this.logProxySource("timeout", proxyInfo);
       return false;
     }
 
@@ -216,6 +261,64 @@ const ProxyMonitor = {
     return `${type}:${host}:${port}`;
   },
 
+  // If proxy.settings is used to change the proxy, an extension will
+  // be "in control".  This returns the id of that extension.
+  async getControllingExtension() {
+    // Is this proxied by an extension that set proxy prefs?
+    let setting = await ExtensionPreferencesManager.getSetting("proxy.settings");
+    return setting?.id;
+  },
+
+  async getProxySource(proxyInfo) {
+      // sourceId is set when using proxy.onRequest
+    if (proxyInfo.sourceId) {
+      return {
+        source: proxyInfo.sourceId,
+        type: "api"
+      };
+    }
+    let type = PROXY_CONFIG_TYPES[ProxyService.proxyConfigType] || "unknown";
+
+    // If we have a policy it will have set the prefs.
+    if (Services.policies.status === Services.policies.ACTIVE) {
+      let policies = Services.policies.getActivePolicies()?.filter(p => p.Proxy);
+      if (policies?.length) {
+        return {
+          source: "policy",
+          type,
+        };
+      }
+    }
+
+    let source = await this.getControllingExtension();
+    return {
+      source: source || "prefs",
+      type,
+    };
+  },
+
+  async logProxySource(state, proxyInfo) {
+    let { source, type } = await this.getProxySource(proxyInfo);
+    this.recordEvent(state, "proxyInfo", type, { source });
+  },
+
+  recordEvent(method, obj, type = null, source = {}) {
+    try {
+      Services.telemetry.recordEvent(
+        "proxyMonitor",
+        method,
+        obj,
+        type,
+        source
+      );
+      log(`event: ${method} ${obj} ${type} ${JSON.stringify(source)}`);
+    } catch (err) {
+      // If the telemetry throws just log the error so it doesn't break any
+      // functionality.
+      Cu.reportError(err);
+    }
+  },
+
   disableProxyInfo(proxyInfo) {
     this.dumpProxies(proxyInfo, "disableProxyInfo");
     let key = this.getProxyInfoKey(proxyInfo);
@@ -227,24 +330,26 @@ const ProxyMonitor = {
     for (let [k ,err] of this.errors) {
       if (hoursSince(err.time) >= DISABLE_HOURS) {
         this.errors.delete(k);
+        this.recordEvent("timeout", "proxyInfo");
       }
     }
-    log(`disable ${key}`);
     this.errors.set(key, { time: Date.now() });
+    this.logProxySource("disabled", proxyInfo);
     // If lots of proxies have failed, we
     // disable all proxies for a while to ensure system
     // requests have the best oportunity to get
     // through.
-    if (this.errors.size >= MAX_DISABLED_PI) {
+    if (!this.disabledTime && this.errors.size >= MAX_DISABLED_PI) {
       this.disabledTime = Date.now();
+      this.recordEvent("start", "proxyBypass");
     }
   },
 
   enableProxyInfo(proxyInfo) {
     let key = this.getProxyInfoKey(proxyInfo);
     if (key && this.errors.has(key)) {
-      log(`enable ${key}`);
       this.errors.delete(key);
+      this.logProxySource("enabled", proxyInfo);
     }
   },
 
@@ -396,7 +501,7 @@ const monitor = {
           break;
         }
         let [extension] = args;
-        // Policy is still active, pass the id to ignore it.
+        // WebExtensionPolicy is still active, pass the id to ignore it.
         if (monitor.running 
             && !extension.isAppProvided 
             && !monitor.hasProxyExtension(extension.id)) {
@@ -424,6 +529,18 @@ const monitor = {
 
 this.failover = class extends ExtensionAPI {
   onStartup() {
+    Services.telemetry.registerEvents("proxyMonitor", {
+      proxyMonitor: {
+        methods: ["enabled", "disabled", "start", "timeout"],
+        objects: [
+          "proxyInfo",
+          "proxyBypass"
+        ],
+        extra_keys: ["source"],
+        record_on_release: true,
+      },
+    });
+
     monitor.startup();
     Services.prefs.addObserver(PREF_PROXY_FAILOVER, monitor);
   }
