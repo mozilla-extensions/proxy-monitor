@@ -120,44 +120,33 @@ const ProxyMonitor = {
         return;
       }
 
-      // Proxies are configured so we want to monitor for non-connection errors 
-      // such as invalid proxy servers.  We also monitor for direct connection 
-      // failures if we end up pruning all proxies below.
+      // We monitor for successful connections which in some cases may 
+      // re-enable a prior failed proxy configuration.
       let wrapper = ChannelWrapper.get(channel);
-      wrapper.addEventListener("error", this);
       wrapper.addEventListener("start", this);
 
-      // If we have to many proxyInfo objects disabled we try direct first and
-      // failover to the proxy config.
       if (this.tooManyFailures()) {
         log(`too many proxy config failures, prepend direct rid ${wrapper.id}`);
-        // A lot of failures are happening, prepend a direct proxy. If direct connections
-        // fail, the configured proxies will act as failover.
-        proxyInfo = this.newDirectProxyInfo(defaultProxyInfo);
+        // A lot of failures are happening.  Try direct first, but failover to 
+        // any non-extension proxies "just in case".
+        proxyInfo = this.newDirectProxyInfo(await this.pruneExtensions(defaultProxyInfo));
         return;
       }
       this.dumpProxies(proxyInfo, `starting proxyInfo rid ${wrapper.id}`);
 
-      let enabledProxies = this.pruneProxyInfo(proxyInfo);
-      if (!enabledProxies.length) {
-        // No proxies are left enabled, prepend a direct proxy. If direct connections
-        // fail, the configured proxies will act as failover.  In this case the
-        // defaultProxyInfo chain was not changed.
+      proxyInfo = this.pruneProxyInfo(proxyInfo);
+      if (!proxyInfo) {
+        // All current proxies are disabled due to prior failures.  Try direct
+        // first, but failover to any non-extension proxies "just in case".
         log(`all proxies disabled, prepend direct`);
-        proxyInfo = this.newDirectProxyInfo(defaultProxyInfo);
+        proxyInfo = this.newDirectProxyInfo(await this.pruneExtensions(defaultProxyInfo));
         return;
       }
-  
-      proxyInfo = enabledProxies[0];
-      let lastFailover = enabledProxies.pop();
 
-      if (lastFailover.failoverProxy || lastFailover.type != PROXY_DIRECT) {
-        // Ensure there is always a direct failover for our critical requests.  This
-        // catches connection failures such as those to non-existant or non-http ports.
-        // The "error" handler added above catches http connections that are not proxy servers.
-        lastFailover.failoverProxy = this.newDirectProxyInfo();
-        log(`direct failover added to proxy chain rid ${wrapper.id}`);
-      }
+      // If we are not attempting a direct bypass we want to monitor for non-connection errors 
+      // such as invalid proxy servers.  
+      wrapper.addEventListener("error", this);
+
       // A little debug output
       this.dumpProxies(proxyInfo, `pruned proxyInfo rid ${wrapper.id}`);
     } finally {
@@ -166,6 +155,44 @@ const ProxyMonitor = {
     }
   },
 
+  relinkProxyInfoChain(proxies) {
+    if (!proxies.length) {
+      return null;
+    }
+    // Re-link the proxy chain.
+    // failoverProxy cannot be set to undefined or null, we fixup the last failover
+    // with a direct failover if necessary.
+    for (let i = 0; i < proxies.length - 2; i++) {
+      proxies[i].failoverProxy = proxies[i + 1];
+    }
+    let last = proxies.pop();
+    // Ensure the last proxy is not linked to something we removed.  This
+    // catches connection failures such as those to non-existant or non-http ports.
+    // The "error" handler added above catches http connections that are not proxy servers.
+    if (last.failoverProxy || last.type != PROXY_DIRECT) {
+      last.failoverProxy = this.newDirectProxyInfo();
+    }
+    return proxies[0];
+  },
+
+  async pruneExtensions(proxyInfo) {
+    // If an extension controls the settings, we must assume that all PIs
+    // came from the extension.
+    let extensionId = await this.getControllingExtension();
+    if (extensionId) {
+      return null;
+    }
+    let enabledProxies = [];
+    let pi = proxyInfo;
+    while (pi) {
+      if (!pi.sourceId) {
+        enabledProxies.push(pi);
+      }
+      pi = pi.failoverProxy;
+    }
+    return this.relinkProxyInfoChain(enabledProxies);
+  },
+  
   // Verify the entire proxy failover chain is clean.  There may be multiple
   // sources for proxyInfo in the chain, so we remove any disabled entries
   // and continue to use configurations that have not yet failed.
@@ -178,13 +205,7 @@ const ProxyMonitor = {
       }
       pi = pi.failoverProxy;
     }
-    // Re-link the proxy chain.
-    // failoverProxy cannot be set to undefined or null, we fixup the last failover
-    // later with a direct failover if necessary.
-    for (let i = 0; i < enabledProxies.length - 2; i++) {
-      enabledProxies[i].failoverProxy = enabledProxies[i + 1];
-    }
-    return enabledProxies;
+    return this.relinkProxyInfoChain(enabledProxies);
   },
 
   dumpProxies(proxyInfo, msg) {
