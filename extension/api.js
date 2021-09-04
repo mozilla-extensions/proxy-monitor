@@ -46,7 +46,6 @@ const DISABLE_HOURS = 48;
 const MAX_DISABLED_PI = 5;
 const PREF_MONITOR_DATA = "extensions.proxyMonitor";
 const PREF_PROXY_FAILOVER = "network.proxy.failover_direct";
-const SOURCE_SUPPORTED = Services.vc.compare(Services.appinfo.version, "92.0") >= 0;
 
 const PROXY_CONFIG_TYPES = [
   "direct",
@@ -182,9 +181,6 @@ const ProxyMonitor = {
     let extensionId = await this.getControllingExtension();
     if (extensionId) {
       return null;
-    }
-    if (!SOURCE_SUPPORTED) {
-      return proxyInfo;
     }
     let enabledProxies = [];
     let pi = proxyInfo;
