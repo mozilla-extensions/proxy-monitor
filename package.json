@@ -12,5 +12,5 @@
     "build": "web-ext build -s extension --overwrite-dest --filename proxy-monitor.xpi",
     "lint": "web-ext lint -s extension"
   },
-  "docker-image": "lts"
+  "docker-image": "node-lts-latest"
 }
