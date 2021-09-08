@@ -12,28 +12,10 @@ XPCOMUtils.defineLazyServiceGetter(
   "nsIProtocolProxyService"
 );
 
-ChromeUtils.defineModuleGetter(
-  this,
-  "ExtensionParent",
-  "resource://gre/modules/ExtensionParent.jsm",
-);
-
-XPCOMUtils.defineLazyGetter(
-  this,
-  "Management",
-  () => ExtensionParent.apiManager
-);
-ChromeUtils.defineModuleGetter(
-  this,
-  "ExtensionPreferencesManager",
-  "resource://gre/modules/ExtensionPreferencesManager.jsm"
-);
-
-ChromeUtils.defineModuleGetter(
-  this,
-  "ExtensionParent",
-  "resource://gre/modules/ExtensionParent.jsm",
-);
+XPCOMUtils.defineLazyModuleGetters(this, {
+  ExtensionParent: "resource://gre/modules/ExtensionParent.jsm",
+  ExtensionPreferencesManager: "resource://gre/modules/ExtensionPreferencesManager.jsm",
+});
 
 XPCOMUtils.defineLazyGetter(
   this,
@@ -353,6 +335,18 @@ const ProxyMonitor = {
     }
   },
 
+  tlsCheck(channel) {
+    let securityInfo = channel.securityInfo;
+    if (!securityInfo) {
+      return false;
+    }
+
+    securityInfo.QueryInterface(Ci.nsITransportSecurityInfo);
+    const wpl = Ci.nsIWebProgressListener;
+    const state = securityInfo.securityState;
+    return state &  wpl.STATE_IS_SECURE
+  },
+
   handleEvent(event) {
     let wrapper = event.currentTarget; // channel wrapper
     let { channel } = wrapper;
@@ -361,14 +355,21 @@ const ProxyMonitor = {
       return;
     }
 
-    log(`request event ${event.type} rid ${wrapper.id} status ${wrapper.statusCode}`);
+    // If the tls handshake is a success, we never disable the proxy on any error
+    // and on any status in the request we consider it valid and will enable if
+    // it was somehow disabled in a prior failure.
+    let tlsIsSecure = this.tlsCheck(channel);
+
+    log(`request event ${event.type} rid ${wrapper.id} status ${wrapper.statusCode} tls ${tlsIsSecure}`);
     switch (event.type) {
       case "error":
-        this.disableProxyInfo(channel.proxyInfo);
+        if (!tlsIsSecure) {
+          this.disableProxyInfo(channel.proxyInfo);
+        }
         break;
       case "start":
         let status = wrapper.statusCode;
-        if (status >= 200 && status < 400) {
+        if (tlsIsSecure || status >= 200 && status < 400) {
           this.enableProxyInfo(channel.proxyInfo);
         }
         break;
