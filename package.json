@@ -1,0 +1,16 @@
+{
+  "name": "proxy-monitor",
+  "version": "1.0.0",
+  "description": "Direct Failover for system requests.",
+  "repository": "https://github.com/mozilla-extensions/proxy-monitor",
+  "license": "MPLv2",
+  "private": true,
+  "devDependencies": {
+    "web-ext": "^6.1.0"
+  },
+  "scripts": {
+    "build": "web-ext build -s extension --overwrite-dest --filename proxy-monitor.xpi",
+    "lint": "web-ext lint -s extension"
+  },
+  "docker-image": "node-lts-latest"
+}
