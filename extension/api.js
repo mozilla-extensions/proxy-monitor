@@ -11,29 +11,17 @@ XPCOMUtils.defineLazyServiceGetter(
   "@mozilla.org/network/protocol-proxy-service;1",
   "nsIProtocolProxyService"
 );
-
-ChromeUtils.defineModuleGetter(
+XPCOMUtils.defineLazyServiceGetter(
   this,
-  "ExtensionParent",
-  "resource://gre/modules/ExtensionParent.jsm",
+  "NSSErrorsService",
+  "@mozilla.org/nss_errors_service;1",
+  "nsINSSErrorsService"
 );
 
-XPCOMUtils.defineLazyGetter(
-  this,
-  "Management",
-  () => ExtensionParent.apiManager
-);
-ChromeUtils.defineModuleGetter(
-  this,
-  "ExtensionPreferencesManager",
-  "resource://gre/modules/ExtensionPreferencesManager.jsm"
-);
-
-ChromeUtils.defineModuleGetter(
-  this,
-  "ExtensionParent",
-  "resource://gre/modules/ExtensionParent.jsm",
-);
+XPCOMUtils.defineLazyModuleGetters(this, {
+  ExtensionParent: "resource://gre/modules/ExtensionParent.jsm",
+  ExtensionPreferencesManager: "resource://gre/modules/ExtensionPreferencesManager.jsm",
+});
 
 XPCOMUtils.defineLazyGetter(
   this,
@@ -165,6 +153,7 @@ const ProxyMonitor = {
     for (let i = 0; i < proxies.length - 2; i++) {
       proxies[i].failoverProxy = proxies[i + 1];
     }
+    let top = proxies[0];
     let last = proxies.pop();
     // Ensure the last proxy is not linked to something we removed.  This
     // catches connection failures such as those to non-existant or non-http ports.
@@ -172,7 +161,7 @@ const ProxyMonitor = {
     if (last.failoverProxy || last.type != PROXY_DIRECT) {
       last.failoverProxy = this.newDirectProxyInfo();
     }
-    return proxies[0];
+    return top;
   },
 
   async pruneExtensions(proxyInfo) {
@@ -353,6 +342,21 @@ const ProxyMonitor = {
     }
   },
 
+  tlsCheck(channel) {
+    let securityInfo = channel.securityInfo;
+    if (!securityInfo) {
+      return false;
+    }
+    securityInfo.QueryInterface(Ci.nsITransportSecurityInfo);
+    if (NSSErrorsService.isNSSErrorCode(securityInfo.errorCode)) {
+      return false;
+    }
+
+    const wpl = Ci.nsIWebProgressListener;
+    const state = securityInfo.securityState;
+    return !!(state &  wpl.STATE_IS_SECURE);
+  },
+
   handleEvent(event) {
     let wrapper = event.currentTarget; // channel wrapper
     let { channel } = wrapper;
@@ -360,17 +364,30 @@ const ProxyMonitor = {
       log(`got ${event.type} event but not a proxied channel`);
       return;
     }
+    // If this is an http request ignore it, it is too easily
+    // tampered with.  Fortunately its use is limited, potentially
+    // only captive portal.
+    if (wrapper.finalURL.startsWith("http:")) {
+      return;
+    }
 
-    log(`request event ${event.type} rid ${wrapper.id} status ${wrapper.statusCode}`);
+    // The tls handshake must succeed to re-enable a request.
+    let tlsIsSecure = this.tlsCheck(channel);
+
+    log(`request event ${event.type} rid ${wrapper.id} status ${wrapper.statusCode} tls ${tlsIsSecure} for ${channel.URI.spec}`);
+    let status = wrapper.statusCode;
     switch (event.type) {
       case "error":
-        this.disableProxyInfo(channel.proxyInfo);
+        if (!tlsIsSecure || status == 0) {
+          this.disableProxyInfo(channel.proxyInfo);
+        }
         break;
       case "start":
-        let status = wrapper.statusCode;
-        if (status >= 200 && status < 400) {
+        if (tlsIsSecure && status >= 200 && status < 400) {
           this.enableProxyInfo(channel.proxyInfo);
         }
+        break;
+      default:
         break;
     }
   },
