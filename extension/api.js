@@ -128,7 +128,7 @@ const ProxyMonitor = {
       }
       this.dumpProxies(proxyInfo, `starting proxyInfo rid ${wrapper.id}`);
 
-      proxyInfo = await this.pruneProxyInfo(proxyInfo);
+      proxyInfo = this.pruneProxyInfo(proxyInfo);
       if (!proxyInfo) {
         // All current proxies are disabled due to prior failures.  Try direct
         // first, but failover to any non-extension proxies "just in case".
@@ -191,11 +191,11 @@ const ProxyMonitor = {
   // Verify the entire proxy failover chain is clean.  There may be multiple
   // sources for proxyInfo in the chain, so we remove any disabled entries
   // and continue to use configurations that have not yet failed.
-  async pruneProxyInfo(proxyInfo) {
+  pruneProxyInfo(proxyInfo) {
     let enabledProxies = [];
     let pi = proxyInfo;
     while (pi) {
-      if (!(await this.proxyDisabled(pi))) {
+      if (!this.proxyDisabled(pi)) {
         enabledProxies.push(pi);
       }
       pi = pi.failoverProxy;
@@ -225,7 +225,7 @@ const ProxyMonitor = {
     return !!this.disabledTime;
   },
 
-  async proxyDisabled(proxyInfo) {
+  proxyDisabled(proxyInfo) {
     let key = this.getProxyInfoKey(proxyInfo);
     if (!key) {
       return false;
