@@ -346,13 +346,10 @@ const ProxyMonitor = {
       return;
     }
 
-    // From 92 forward, we only look at disabling extension provided proxy configurations.
+    // From 92 forward, we disable all extension provided proxies if one fails
     let extensionId;
     if (CHECK_EXTENSION_ONLY) {
       extensionId = proxyInfo.sourceId || (await this.getControllingExtension());
-      if (!extensionId) {
-        return;
-      }
     }
 
     this.timeoutEntries();
