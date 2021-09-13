@@ -31,9 +31,10 @@ XPCOMUtils.defineLazyGetter(
 
 const PROXY_DIRECT = "direct";
 const DISABLE_HOURS = 48;
-const MAX_DISABLED_PI = 5;
+const MAX_DISABLED_PI = 2;
 const PREF_MONITOR_DATA = "extensions.proxyMonitor";
 const PREF_PROXY_FAILOVER = "network.proxy.failover_direct";
+const CHECK_EXTENSION_ONLY = Services.vc.compare(Services.appinfo.version, "92.0") >= 0
 
 const PROXY_CONFIG_TYPES = [
   "direct",
@@ -80,12 +81,17 @@ function log(msg) {
  * 4. If we've removed all proxies we make a direct config first and failover to 
  * the other proxy configurations, similar to step 3.
  * 
+ * 5. Starting with Fx92, we will only disable proxy configurations provided by
+ * extensions.  Prior to 92, we could not definitively identify extensions from
+ * the proxyInfo instance.
+ * 
  * If we've disabled proxies, we continue to watch the requests for failures in
  * "direct" connection mode.  If we continue to fail with direct connections,
  * we fall back to allowing proxies again.
  */
 const ProxyMonitor = {
   errors: new Map(),
+  extensions: new Map(),
   disabledTime: 0,
 
   newDirectProxyInfo(failover = null) {
@@ -213,7 +219,7 @@ const ProxyMonitor = {
     // If we have lots of PIs that are failing in a short period of time then
     // we back off proxy for a while.
     if (this.disabledTime && hoursSince(this.disabledTime) >= DISABLE_HOURS) {
-      this.recordEvent("timeout", "proxyBypass");
+      this.recordEvent("timeout", "proxyBypass", "global");
       this.reset();
     }
     return !!this.disabledTime;
@@ -225,12 +231,19 @@ const ProxyMonitor = {
       return false;
     }
 
+    // From 92 forward, if an extension has one disabled PI, we disable all PIs from 
+    // that extension for the DISABLE_HOURS perid.
+    let extTime = proxyInfo.sourceId && this.extensions.get(proxyInfo.sourceId);
+    if (extTime && hoursSince(extTime) <= DISABLE_HOURS) {
+      return true;
+    }
+
     let err = this.errors.get(key);
     if (!err) {
       return false;
     }
 
-    // We keep a proxy config disabled for 48 hours to give
+    // We keep a proxy config disabled for DISABLE_HOURS to give
     // our daily update checks time to complete again.
     if (hoursSince(err.time) >= DISABLE_HOURS) {
       this.errors.delete(key);
@@ -308,13 +321,7 @@ const ProxyMonitor = {
     }
   },
 
-  disableProxyInfo(proxyInfo) {
-    this.dumpProxies(proxyInfo, "disableProxyInfo");
-    let key = this.getProxyInfoKey(proxyInfo);
-    if (!key) {
-      log(`direct request failure`);
-      return;
-    }
+  timeoutEntries() {
     // remove old entries
     for (let [k ,err] of this.errors) {
       if (hoursSince(err.time) >= DISABLE_HOURS) {
@@ -322,7 +329,38 @@ const ProxyMonitor = {
         this.recordEvent("timeout", "proxyInfo");
       }
     }
-    this.errors.set(key, { time: Date.now() });
+    for (let [e, t] of this.extensions) {
+      if (hoursSince(t) >= DISABLE_HOURS) {
+        this.extensions.delete(e);
+        // Not a full bypass, but an extension bypass
+        this.recordEvent("timeout", "proxyBypass", "extension", { source: e });
+      }
+    }
+  },
+
+  async disableProxyInfo(proxyInfo) {
+    this.dumpProxies(proxyInfo, "disableProxyInfo");
+    let key = this.getProxyInfoKey(proxyInfo);
+    if (!key) {
+      log(`direct request failure`);
+      return;
+    }
+
+    // From 92 forward, we disable all extension provided proxies if one fails
+    let extensionId;
+    if (CHECK_EXTENSION_ONLY) {
+      extensionId = proxyInfo.sourceId || (await this.getControllingExtension());
+    }
+
+    this.timeoutEntries();
+
+    let err = { time: Date.now(), extensionId };
+    this.errors.set(key, err);
+    if (extensionId) {
+      this.extensions.set(extensionId, err.time);
+      log(`all proxy configuration from extension ${extensionId} disabled`);
+      this.recordEvent("start", "proxyBypass", "extension", { source: extensionId });
+    }
     this.logProxySource("disabled", proxyInfo);
     // If lots of proxies have failed, we
     // disable all proxies for a while to ensure system
@@ -330,16 +368,34 @@ const ProxyMonitor = {
     // through.
     if (!this.disabledTime && this.errors.size >= MAX_DISABLED_PI) {
       this.disabledTime = Date.now();
-      this.recordEvent("start", "proxyBypass");
+      this.recordEvent("start", "proxyBypass", "global");
     }
   },
 
-  enableProxyInfo(proxyInfo) {
+  async enableProxyInfo(proxyInfo) {
     let key = this.getProxyInfoKey(proxyInfo);
-    if (key && this.errors.has(key)) {
-      this.errors.delete(key);
+    if (!key) {
+      return;
+    }
+    if (this.errors.delete(key)) {
       this.logProxySource("enabled", proxyInfo);
     }
+    // From 92 forward, we have tracked extensions.  If no keys are disabled,
+    // remove the extension from the disabled list.
+    if (!CHECK_EXTENSION_ONLY) {
+      return;
+    }
+    let extensionId = proxyInfo.sourceId || (await this.getControllingExtension());
+    if (!extensionId) {
+      return;
+    }
+    // Only delete if no err entries with the id exists.
+    for (let [k ,err] of this.errors) {
+      if (err.extensionId == extensionId) {
+        return;
+      }
+    }
+    this.extensions.delete(extensionId);
   },
 
   tlsCheck(channel) {
@@ -415,9 +471,11 @@ const ProxyMonitor = {
       failovers = JSON.parse(failovers);
       this.disabledTime = failovers.disabledTime;
       this.errors = new Map(failovers.errors);
+      this.extensions = new Map(failovers.errors?.filter(e => e[1].extensionId).sort((a, b) => a[1].time - b[1].time).map(e => [e[1].extensionId, e[1].time]));
     } else {
       this.disabledTime = 0;
       this.errors = new Map();
+      this.extensions = new Map();
     }
   },
 
