@@ -471,7 +471,7 @@ const ProxyMonitor = {
       failovers = JSON.parse(failovers);
       this.disabledTime = failovers.disabledTime;
       this.errors = new Map(failovers.errors);
-      this.extensions = new Map(failovers.errors?.filter(e => e[1].extensionId).sort((a, b) => a[1].time > b[1].time).map(e => [e[1].extensionId, e[1].time]));
+      this.extensions = new Map(failovers.errors?.filter(e => e[1].extensionId).sort((a, b) => a[1].time - b[1].time).map(e => [e[1].extensionId, e[1].time]));
     } else {
       this.disabledTime = 0;
       this.errors = new Map();
