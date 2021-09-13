@@ -13,11 +13,15 @@ information about the specific proxy, such as IP address, etc.
 - Objects
   - "proxyBypass" a direct bypass has started or ended
   - "proxyInfo" a single specific proxy configuration
-- Type: The type of the proxy configuration if "proxyInfo"
-  - "api" The source is the proxy.onRequest API listener
-  - "direct", "manual", "pac", "wpad", "system" The type of proxy configuration defined in preferences, possibly through extension settings
+- Type: 
+  - The type of the proxy configuration if "proxyInfo"
+    - "api" The source is the proxy.onRequest API listener
+    - "direct", "manual", "pac", "wpad", "system" The type of proxy configuration defined in preferences, possibly through extension settings
+  - The type of bypass if "proxyBypass"
+    - "gobal" all proxies are disabled
+    - "extension" a specific extension is disabled, identified by "source"
 - extra keys: 
-  - "source" The source of the proxy configuration if "proxyInfo"
+  - "source" The source of the proxy configuration
     - values: 
       - The `extension id` if the proxy is from an extension through an API or by modifying preferences through settings.
       - "policy" if the proxy is configured in enterprise policy

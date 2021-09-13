@@ -219,7 +219,7 @@ const ProxyMonitor = {
     // If we have lots of PIs that are failing in a short period of time then
     // we back off proxy for a while.
     if (this.disabledTime && hoursSince(this.disabledTime) >= DISABLE_HOURS) {
-      this.recordEvent("timeout", "proxyBypass");
+      this.recordEvent("timeout", "proxyBypass", "global");
       this.reset();
     }
     return !!this.disabledTime;
@@ -332,6 +332,8 @@ const ProxyMonitor = {
     for (let [e, t] of this.extensions) {
       if (hoursSince(t) >= DISABLE_HOURS) {
         this.extensions.delete(e);
+        // Not a full bypass, but an extension bypass
+        this.recordEvent("timeout", "proxyBypass", "extension", { source: e });
       }
     }
   },
@@ -360,6 +362,7 @@ const ProxyMonitor = {
     if (extensionId) {
       this.extensions.set(extensionId, err.time);
       log(`all proxy configuration from extension ${extensionId} disabled`);
+      this.recordEvent("start", "proxyBypass", "extension", { source: extensionId });
     }
     this.logProxySource("disabled", proxyInfo);
     // If lots of proxies have failed, we
@@ -368,7 +371,7 @@ const ProxyMonitor = {
     // through.
     if (!this.disabledTime && this.errors.size >= MAX_DISABLED_PI) {
       this.disabledTime = Date.now();
-      this.recordEvent("start", "proxyBypass");
+      this.recordEvent("start", "proxyBypass", "global");
     }
   },
 
@@ -377,8 +380,9 @@ const ProxyMonitor = {
     if (!key) {
       return;
     }
-    this.errors.delete(key);
-    this.logProxySource("enabled", proxyInfo);
+    if (this.errors.delete(key)) {
+      this.logProxySource("enabled", proxyInfo);
+    }
     // From 92 forward, we have tracked extensions.  If no keys are disabled,
     // remove the extension from the disabled list.
     if (!CHECK_EXTENSION_ONLY) {
@@ -460,7 +464,6 @@ const ProxyMonitor = {
     let data = JSON.stringify({
       disabledTime: this.disabledTime,
       errors: Array.from(this.errors),
-      extensions: Array.from(this.extensions),
     });
     Services.prefs.setStringPref(PREF_MONITOR_DATA, data);
   },
@@ -471,7 +474,7 @@ const ProxyMonitor = {
       failovers = JSON.parse(failovers);
       this.disabledTime = failovers.disabledTime;
       this.errors = new Map(failovers.errors);
-      this.extensions = new Map(failovers.extensions);
+      this.extensions = new Map(failovers.errors?.filter(e => e[1].extensionId).sort((a, b) => a[1].time > b[1].time).map(e => [e[1].extensionId, e[1].time]));
     } else {
       this.disabledTime = 0;
       this.errors = new Map();
