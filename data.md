@@ -18,7 +18,7 @@ information about the specific proxy, such as IP address, etc.
     - "api" The source is the proxy.onRequest API listener
     - "direct", "manual", "pac", "wpad", "system" The type of proxy configuration defined in preferences, possibly through extension settings
   - The type of bypass if "proxyBypass"
-    - "gobal" all proxies are disabled
+    - "global" all proxies are disabled
     - "extension" a specific extension is disabled, identified by "source"
 - extra keys: 
   - "source" The source of the proxy configuration
