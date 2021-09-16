@@ -32,7 +32,8 @@ XPCOMUtils.defineLazyGetter(
 const PROXY_DIRECT = "direct";
 const DISABLE_HOURS = 48;
 const MAX_DISABLED_PI = 2;
-const PREF_MONITOR_DATA = "extensions.proxyMonitor";
+const PREF_MONITOR_DATA = "extensions.proxyMonitor.state";
+const PREF_MONITOR_LOGGING = "extensions.proxyMonitor.logging.enabled";
 const PREF_PROXY_FAILOVER = "network.proxy.failover_direct";
 const CHECK_EXTENSION_ONLY = Services.vc.compare(Services.appinfo.version, "92.0") >= 0
 
@@ -50,7 +51,7 @@ function hoursSince(dt2, dt1 = Date.now()) {
   return Math.abs(Math.round(diff));
 }
 
-const DEBUG_LOG=1
+const DEBUG_LOG = Services.prefs.getBoolPref(PREF_MONITOR_LOGGING, true);
 function log(msg) {
   if (DEBUG_LOG) {
     console.log(`proxy-monitor: ${msg}`);
@@ -471,7 +472,7 @@ const ProxyMonitor = {
       failovers = JSON.parse(failovers);
       this.disabledTime = failovers.disabledTime;
       this.errors = new Map(failovers.errors);
-      this.extensions = new Map(failovers.errors?.filter(e => e[1].extensionId).sort((a, b) => a[1].time - b[1].time).map(e => [e[1].extensionId, e[1].time]));
+      this.extensions = new Map(failovers.errors.filter(e => e[1].extensionId).sort((a, b) => a[1].time - b[1].time).map(e => [e[1].extensionId, e[1].time]));
     } else {
       this.disabledTime = 0;
       this.errors = new Map();
