@@ -1,6 +1,6 @@
 {
   "name": "proxy-monitor",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Direct Failover for system requests.",
   "repository": "https://github.com/mozilla-extensions/proxy-monitor",
   "license": "MPLv2",
