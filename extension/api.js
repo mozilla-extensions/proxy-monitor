@@ -41,6 +41,7 @@ const PROXY_CONFIG_TYPES = [
   "direct",
   "manual",
   "pac",
+  "unused", // nsIProtocolProxyService.idl skips index 3.
   "wpad",
   "system"
 ];

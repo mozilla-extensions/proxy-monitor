@@ -8,7 +8,7 @@
       "strict_max_version": "100.0"
     }
   },
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Direct Failover for system requests.",
   "experiment_apis": {
     "failover": {
