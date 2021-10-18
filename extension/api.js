@@ -4,9 +4,11 @@
 
 "use strict";
 
-/* globals ExtensionAPI, Services, XPCOMUtils, WebExtensionPolicy */
+/* globals ExtensionAPI, XPCOMUtils */
 
+const { Services } = ChromeUtils.import("resource://gre/modules/Services.jsm");
 XPCOMUtils.defineLazyGlobalGetters(this, ["ChannelWrapper"]);
+const { WebExtensionPolicy } = Cu.getGlobalForObject(Services);
 
 XPCOMUtils.defineLazyServiceGetter(
   this,
